@@ -2,8 +2,84 @@ import argparse
 import asyncio
 import logging
 import os
+import json
 from datetime import datetime
 from typing import Literal
+
+import dotenv
+# Construct the absolute path to the .env file
+# Assumes .env is in the 'metac-bot-template' subdirectory relative to main.py
+dotenv_path = os.path.join(os.path.dirname(__file__), "metac-bot-template", ".env")
+print(f"DEBUG: Attempting to load .env file from: {dotenv_path}")
+# Load the .env file, override to ensure it reloads if already loaded by something else
+loaded_correctly = dotenv.load_dotenv(dotenv_path=dotenv_path, override=True)
+print(f"DEBUG: dotenv.load_dotenv(dotenv_path='{dotenv_path}', override=True) returned: {loaded_correctly}")
+
+# --- LITELLM IMPORT MOVED EARLIER --- (No longer part of the "LITELLM IMPORT AND PATCHING MOVED EARLIER" block title)
+import litellm 
+
+# Explicitly set Anthropic API key for LiteLLM
+anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+if anthropic_key:
+    litellm.anthropic_api_key = anthropic_key
+    # Mask the key for logging, showing only last 4 chars
+    masked_key_display = f"...{anthropic_key[-4:]}" if len(anthropic_key) > 4 else "(key too short to mask)"
+    print(f"DEBUG: Explicitly set litellm.anthropic_api_key to: {masked_key_display}")
+else:
+    print("DEBUG: ANTHROPIC_API_KEY not found in environment by os.getenv() for explicit litellm setting.")
+
+# Add OpenAI package for direct calls
+import openai
+
+# --- LITELLM PATCHING SECTION --- (Original block title might be slightly misleading now, but logic follows)
+# Save the original functions
+_original_completion = litellm.completion
+_original_acompletion = litellm.acompletion
+
+# Create a patched version that adds provider if missing
+def patched_completion(*args, **kwargs):
+    print(f"DEBUG: patched_completion (SYNC) called with args: {args}, kwargs: {kwargs}")
+    model = kwargs.get("model")
+    # Ensure model is a string before operating on it
+    if isinstance(model, str) and "/" not in model: # Removed provider check, as we will set model name directly
+        print(f"DEBUG: Model '{model}' (SYNC) is bare. Original kwargs provider: {kwargs.get('provider')}")
+        if "claude" in model.lower():
+            original_model_name = model
+            kwargs["model"] = f"anthropic/{model}"
+            # If provider was explicitly None or something else, LiteLLM might get confused if we don't remove/override it
+            # However, LiteLLM should prioritize the provider in the model string.
+            # For safety, ensure no conflicting provider kwarg is passed if we prefix the model.
+            if "provider" in kwargs:
+                print(f"DEBUG: Removing explicit provider kwarg for '{original_model_name}' as model is now prefixed.")
+                del kwargs["provider"] # Or set to None, but deleting is cleaner if model prefix is king
+            print(f"DEBUG: Model name for '{original_model_name}' (SYNC) modified to '{kwargs['model']}'")
+    return _original_completion(*args, **kwargs)
+
+# Create a patched version for async completion
+async def patched_acompletion(*args, **kwargs):
+    print(f"DEBUG: patched_acompletion (ASYNC) called with args: {args}, kwargs: {kwargs}")
+    model = kwargs.get("model")
+    # Ensure model is a string before operating on it
+    if isinstance(model, str) and "/" not in model: # Removed provider check, as we will set model name directly
+        print(f"DEBUG: Model '{model}' (ASYNC) is bare. Original kwargs provider: {kwargs.get('provider')}")
+        if "claude" in model.lower():
+            original_model_name = model
+            kwargs["model"] = f"anthropic/{model}"
+            # Ensure no conflicting provider kwarg is passed if we prefix the model.
+            if "provider" in kwargs:
+                print(f"DEBUG: Removing explicit provider kwarg for '{original_model_name}' as model is now prefixed.")
+                del kwargs["provider"]
+            print(f"DEBUG: Model name for '{original_model_name}' (ASYNC) modified to '{kwargs['model']}'")
+    return await _original_acompletion(*args, **kwargs)
+
+# Replace the original functions with our patched versions
+litellm.completion = patched_completion
+litellm.acompletion = patched_acompletion
+# --- END OF LITELLM IMPORT AND PATCHING ---
+
+# Configure OpenAI client if key exists
+if os.getenv("OPENAI_API_KEY"):
+    openai.api_key = os.getenv("OPENAI_API_KEY")
 
 from forecasting_tools import (
     AskNewsSearcher,
@@ -102,15 +178,16 @@ class TemplateForecaster(ForecastBot):
             {question}
             """
         )  # NOTE: The metac bot in Q1 put everything but the question in the system prompt.
-        if use_open_router:
-            model_name = "openrouter/perplexity/sonar-reasoning"
-        else:
-            model_name = "perplexity/sonar-pro"  # perplexity/sonar-reasoning and perplexity/sonar are cheaper, but do only 1 search
-        model = GeneralLlm(
-            model=model_name,
+        
+        # Create a dedicated cheaper Haiku model for research
+        logger.info("DEBUG: Using claude-3-haiku-20240307 for research (cheaper)")
+        research_model = GeneralLlm(
+            model="claude-3-haiku-20240307",  # Using cheaper Haiku model for research
             temperature=0.1,
+            timeout=40
         )
-        response = await model.invoke(prompt)
+        
+        response = await research_model.invoke(prompt)
         return response
 
     async def _call_exa_smart_searcher(self, question: str) -> str:
@@ -353,20 +430,24 @@ if __name__ == "__main__":
 
     template_bot = TemplateForecaster(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=1,  # Reduced from 5 to 1 to save costs
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        # llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
-        #     "default": GeneralLlm(
-        #         model="metaculus/anthropic/claude-3-5-sonnet-20241022",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="claude-3-sonnet-20240229",  # Using Sonnet for predictions
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "summarizer": GeneralLlm(
+                model="claude-3-sonnet-20240229",  # Using Sonnet for summarization
+                temperature=0.1,
+                timeout=40,
+            ),
+        },
     )
 
     if run_mode == "tournament":
